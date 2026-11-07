@@ -101,52 +101,100 @@ class NetCounters:
 
 class TestError(Exception): pass
 
-def _conn(url, timeout=8):
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
+
+def _headers(extra=None):
+    h = {"User-Agent": BROWSER_UA, "Accept": "*/*", "Origin": "https://speed.cloudflare.com",
+         "Referer": "https://speed.cloudflare.com/"}
+    if extra: h.update(extra)
+    return h
+
+def _conn(url, timeout=10):
     u = urllib.parse.urlparse(url)
     cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
     return cls(u.hostname, u.port, timeout=timeout), (u.path or "/") + ("?" + u.query if u.query else "")
 
 def _run_streams(worker, n):
     errs = []; ths = [threading.Thread(target=worker, args=(i, errs), daemon=True) for i in range(n)]
-    [t.start() for t in ths]; [t.join(30) for t in ths]; return errs
+    [t.start() for t in ths]; [t.join(40) for t in ths]; return errs
 
-def download_test(base, seconds=5.0, ramp=1.0, streams=3):
-    """Mbps over `seconds` using parallel streams; first `ramp` seconds (TCP slow start) excluded."""
-    url = base.rstrip("/") + "/__down?bytes=200000000"
-    start = time.monotonic(); counted = [0] * streams; allb = [0] * streams; last = [start] * streams
+def _rate_from_events(events, start, ramp, errs, what):
+    """events = [(completion_time, bytes)]. Skips slow-start ramp; measures between completions."""
+    if not events: raise TestError(f"{what} failed: {errs[:1]}")
+    events.sort(); late = [e for e in events if e[0] - start >= ramp]
+    if len(late) >= 2:
+        return sum(b for _, b in late[1:]) * 8 / 1e6 / max(0.05, late[-1][0] - late[0][0])
+    return sum(b for _, b in events) * 8 / 1e6 / max(0.2, events[-1][0] - start)
+
+def download_test(base, seconds=6.0, ramp=1.5, streams=3, req_bytes=10_000_000):
+    """Cloudflare-style: many 10 MB requests per stream (big single requests get HTTP 403)."""
+    url = base.rstrip("/") + f"/__down?bytes={req_bytes}"
+    start = time.monotonic(); events = []; lock = threading.Lock()
     def w(i, errs):
         try:
-            c, path = _conn(url); c.request("GET", path, headers={"User-Agent": UA}); r = c.getresponse()
+            c, path = _conn(url)
+            while time.monotonic() < start + seconds:
+                c.request("GET", path, headers=_headers()); r = c.getresponse()
+                if r.status != 200: raise TestError(f"HTTP {r.status}")
+                while time.monotonic() < start + seconds:
+                    b = r.read(65536)
+                    if not b: break
+                    with lock: events.append((time.monotonic(), len(b)))
+                else: break
+            c.close()
+        except Exception as e: errs.append(e)
+    errs = _run_streams(w, streams)
+    return _rate_from_events(events, start, ramp, errs, "download test")
+
+def download_file_test(url, seconds=6.0, ramp=1.5, streams=3):
+    """Fallback for plain static files (one long GET per stream)."""
+    start = time.monotonic(); events = []; lock = threading.Lock()
+    def w(i, errs):
+        try:
+            c, path = _conn(url); c.request("GET", path, headers=_headers()); r = c.getresponse()
             if r.status != 200: raise TestError(f"HTTP {r.status}")
             while time.monotonic() < start + seconds:
                 b = r.read(65536)
                 if not b: break
-                now = time.monotonic(); last[i] = now; allb[i] += len(b)
-                if now - start >= ramp: counted[i] += len(b)
+                with lock: events.append((time.monotonic(), len(b)))
             c.close()
         except Exception as e: errs.append(e)
     errs = _run_streams(w, streams)
-    tot = sum(counted)
-    if tot == 0 and sum(allb) > 0:       # very fast link: transfer ended inside the ramp window
-        return sum(allb) * 8 / 1e6 / max(0.2, max(last) - start)
-    if tot == 0: raise TestError(f"download test failed: {errs[:1]}")
-    return tot * 8 / 1e6 / max(0.5, max(last) - start - ramp)
+    return _rate_from_events(events, start, ramp, errs, "download test")
 
-def upload_test(base, seconds=4.0, ramp=1.0, streams=2, chunk=32768):
-    url = base.rstrip("/") + "/__up"
-    start = time.monotonic(); counted = [0] * streams; allb = [0] * streams; last = [start] * streams; data = os.urandom(chunk)
+def upload_test(url, seconds=6.0, ramp=1.5, streams=3, body_bytes=512 * 1024):
+    """POST many 512 KB bodies; bytes are counted only when the server has acknowledged them."""
+    start = time.monotonic(); events = []; lock = threading.Lock(); data = os.urandom(body_bytes)
     def w(i, errs):
         try:
-            c, path = _conn(url); c.putrequest("POST", path); c.putheader("User-Agent", UA)
-            c.putheader("Content-Type", "application/octet-stream"); c.putheader("Content-Length", "500000000"); c.endheaders()
+            c, path = _conn(url)
             while time.monotonic() < start + seconds:
-                c.send(data); now = time.monotonic(); last[i] = now; allb[i] += chunk
-                if now - start >= ramp: counted[i] += chunk
+                c.request("POST", path, body=data, headers=_headers({"Content-Type": "application/octet-stream"}))
+                r = c.getresponse(); r.read()
+                if r.status >= 400: raise TestError(f"HTTP {r.status}")
+                with lock: events.append((time.monotonic(), body_bytes))
             c.close()
         except Exception as e: errs.append(e)
     errs = _run_streams(w, streams)
-    tot = sum(counted)
-    if tot == 0 and sum(allb) > 0:
-        return sum(allb) * 8 / 1e6 / max(0.2, max(last) - start)
-    if tot == 0: raise TestError(f"upload test failed: {errs[:1]}")
-    return tot * 8 / 1e6 / max(0.5, max(last) - start - ramp)
+    return _rate_from_events(events, start, ramp, errs, "upload test")
+
+# (download, upload) sources tried in order until one works
+DOWNLOAD_FALLBACKS = ["https://proof.ovh.net/files/100Mb.dat", "http://speedtest.tele2.net/100MB.zip"]
+UPLOAD_FALLBACKS = ["http://speedtest.tele2.net/upload.php"]
+
+def smart_download(base):
+    errs = []
+    try: return download_test(base), base
+    except Exception as e: errs.append(f"{base}: {e}")
+    for u in DOWNLOAD_FALLBACKS:
+        try: return download_file_test(u), u
+        except Exception as e: errs.append(f"{u}: {e}")
+    raise TestError("; ".join(errs)[:300])
+
+def smart_upload(base):
+    errs = []
+    for u in [base.rstrip("/") + "/__up"] + UPLOAD_FALLBACKS:
+        try: return upload_test(u), u
+        except Exception as e: errs.append(f"{u}: {e}")
+    raise TestError("; ".join(errs)[:300])

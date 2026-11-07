@@ -22,8 +22,9 @@ class Engine:
         self.qos = qos or Qos()
         self.ping = ping or measure.PingMonitor()
         self.counters = counters or measure.NetCounters()
-        self.dl_test = dl_test or (lambda: measure.download_test(self.cfg["speedtest_base"]))
-        self.ul_test = ul_test or (lambda: measure.upload_test(self.cfg["speedtest_base"]))
+        self.dl_test = dl_test or (lambda: self._src("dl", *measure.smart_download(self.cfg["speedtest_base"])))
+        self.ul_test = ul_test or (lambda: self._src("ul", *measure.smart_upload(self.cfg["speedtest_base"])))
+        self._err = None
         self.admin = is_admin() if admin is None else admin
         self.dl = AdaptiveLimiter(safety=0.92)
         self.ul = AdaptiveLimiter(safety=0.90)
@@ -32,6 +33,9 @@ class Engine:
                          ping=None, jitter=0.0, loss=0.0, stability=0, game=False, last_test=None, admin=self.admin)
         self.applied_ul = None; self._next_test = 0.0; self._game_prev = False
         self._quit = threading.Event(); self._thread = None; self._clamp_applied = False; self._mark_applied = False
+
+    def _src(self, kind, mbps, url):
+        log.info("%s test used %s -> %.2f Mbps", kind, url, mbps); return mbps
 
     # ------------------------------------------------------------ lifecycle
     def start(self):
@@ -97,7 +101,8 @@ class Engine:
         if now >= self._next_test and not skip_test:
             self._run_test(now)
         else:
-            self._set(status="Gaming - limits held, no speed tests" if skip_test else "Active - stabilizing")
+            self._set(status="Gaming - limits held, no speed tests" if skip_test else
+                      (f"Speed test failed ({self._err}) - retrying" if self._err and self.ul.limit is None else "Active - stabilizing"))
             if tick % 5 == 0 and p["baseline"] and p["ping"] and self.ul.limit:
                 util = ul / max(self.ul.limit, 0.1)
                 bloat = p["ping"] - p["baseline"]
@@ -132,11 +137,13 @@ class Engine:
             log.info("measured dl=%.2f ul=%.2f -> limits dl=%.2f ul=%.2f", d, u, self.dl.limit, self.ul.limit)
             vol = max(self.dl.volatility, self.ul.volatility)
             self._next_test = time.monotonic() + (self.cfg["test_interval_s"] if vol < 0.25 else self.cfg["test_interval_s"] / 2.5)
+            self._err = None
             self._set(last_test=time.strftime("%H:%M:%S"), dl_limit=self.dl.limit, ul_limit=self.ul.limit)
         except Exception as e:
             log.warning("speed test failed: %s", e)
             self._next_test = time.monotonic() + 60
-            self._set(status="Speed test failed - retrying")
+            self._err = str(e)[:90]
+            self._set(status=f"Speed test failed ({self._err}) - retrying")
         finally:
             self._apply(force=True)                    # always put the throttle back
 

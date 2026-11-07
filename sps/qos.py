@@ -21,9 +21,15 @@ def default_runner(cmd, timeout=40):
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+PS_PRELUDE = (
+    "function G($pat,$store='ActiveStore'){ try { @(Get-NetQosPolicy -PolicyStore $store -ErrorAction Stop | "
+    "Where-Object { $_.Name -like $pat }) } catch { @() } }; "
+)
+
 def ps_cmd(script):
-    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
-            "$ErrorActionPreference='Stop'; " + script]
+    # no 'Stop' globally: missing policies are normal. Real failures are caught and their message is printed to the log.
+    body = "try { " + PS_PRELUDE + script + " } catch { Write-Output ('ERR: ' + $_.Exception.Message); exit 1 }"
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", body]
 
 
 class Qos:
@@ -32,33 +38,32 @@ class Qos:
 
     def _ps(self, script):
         rc, out = self.run(ps_cmd(script))
-        if rc != 0: log.error("PowerShell failed rc=%s: %s", rc, out.strip()[:500])
+        if rc != 0: log.error("PowerShell failed rc=%s: %s", rc, out.strip()[:500] or "(no output)")
         return rc == 0
 
     def set_upload_limit(self, mbps):
         bps = max(100_000, int(mbps * 1_000_000))
         ok = self._ps(
-            f"if (Get-NetQosPolicy -PolicyStore ActiveStore -Name 'SPS_Throttle' -ErrorAction SilentlyContinue) "
-            f"{{ Set-NetQosPolicy -PolicyStore ActiveStore -Name 'SPS_Throttle' -ThrottleRateActionBitsPerSecond {bps} | Out-Null }} "
+            f"if ((G 'SPS_Throttle').Count -gt 0) {{ Set-NetQosPolicy -PolicyStore ActiveStore -Name 'SPS_Throttle' "
+            f"-ThrottleRateActionBitsPerSecond {bps} -ErrorAction Stop | Out-Null }} "
             f"else {{ New-NetQosPolicy -PolicyStore ActiveStore -Name 'SPS_Throttle' -NetworkProfile All "
-            f"-IPProtocolMatchCondition TCP -ThrottleRateActionBitsPerSecond {bps} | Out-Null }}")
+            f"-IPProtocolMatchCondition TCP -ThrottleRateActionBitsPerSecond {bps} -ErrorAction Stop | Out-Null }}")
         if ok: log.info("Upload TCP throttle set to %.2f Mbps", bps / 1e6)
         return ok
 
     def clear_throttle(self):
-        return self._ps("Get-NetQosPolicy -PolicyStore ActiveStore -Name 'SPS_Throttle' -ErrorAction SilentlyContinue "
-                        "| Remove-NetQosPolicy -PolicyStore ActiveStore -Confirm:$false")
+        return self._ps("foreach($p in (G 'SPS_Throttle')){ Remove-NetQosPolicy -PolicyStore ActiveStore -Name 'SPS_Throttle' "
+                        "-Confirm:$false -ErrorAction Stop }")
 
     def set_game_marking(self, enable):
         if not enable:
-            return self._ps("Get-NetQosPolicy -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object Name -like 'SPS_Game*' "
-                            "| Remove-NetQosPolicy -PolicyStore ActiveStore -Confirm:$false")
+            return self._ps("foreach($p in (G 'SPS_Game*')){ Remove-NetQosPolicy -PolicyStore ActiveStore -Name $p.Name "
+                            "-Confirm:$false -ErrorAction Stop }")
         parts = []
         for i, exe in enumerate(GAME_EXES):
             n = f"SPS_Game{i}"
-            parts.append(f"if (-not (Get-NetQosPolicy -PolicyStore ActiveStore -Name '{n}' -ErrorAction SilentlyContinue)) "
-                         f"{{ New-NetQosPolicy -PolicyStore ActiveStore -Name '{n}' -NetworkProfile All "
-                         f"-AppPathNameMatchCondition '{exe}' -DSCPAction 46 | Out-Null }}")
+            parts.append(f"if ((G '{n}').Count -eq 0) {{ New-NetQosPolicy -PolicyStore ActiveStore -Name '{n}' -NetworkProfile All "
+                         f"-AppPathNameMatchCondition '{exe}' -DSCPAction 46 -ErrorAction Stop | Out-Null }}")
         return self._ps("; ".join(parts))
 
     # ---- optional download-side clamp --------------------------------------
@@ -86,8 +91,8 @@ class Qos:
 
     def restore_all(self):
         """Emergency / shutdown path: remove every SPS policy, restore TCP setting."""
-        a = self._ps("foreach($s in 'ActiveStore','localhost'){ Get-NetQosPolicy -PolicyStore $s -ErrorAction SilentlyContinue "
-                     "| Where-Object Name -like 'SPS_*' | Remove-NetQosPolicy -PolicyStore $s -Confirm:$false -ErrorAction SilentlyContinue }")
+        a = self._ps("foreach($st in 'ActiveStore','localhost'){ foreach($p in (G 'SPS_*' $st)){ "
+                     "Remove-NetQosPolicy -PolicyStore $st -Name $p.Name -Confirm:$false -ErrorAction SilentlyContinue } }")
         b = self.restore_autotuning()
         log.info("restore_all: policies=%s autotuning=%s", a, b)
         return a and b

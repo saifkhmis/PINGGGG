@@ -4,21 +4,17 @@ os.environ["LOCALAPPDATA"] = "/tmp/sps_test"
 from sps import measure, qos as qosmod, engine as eng
 
 class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
     def do_GET(self):
-        self.send_response(200); self.send_header("Content-Length", "200000000"); self.end_headers()
-        blk = b"x" * 65536
-        try:
-            for _ in range(3000): self.wfile.write(blk)
+        n = int(self.path.split("bytes=")[1]) if "bytes=" in self.path else 100_000_000
+        if n > 50_000_000: self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers(); return
+        self.send_response(200); self.send_header("Content-Length", str(n)); self.end_headers()
+        try: self.wfile.write(b"x" * n)
         except Exception: pass
     def do_POST(self):
-        n = int(self.headers["Content-Length"]); got = 0
-        try:
-            while got < n:
-                b = self.rfile.read(65536)
-                if not b: break
-                got += len(b)
-        except Exception: pass
+        n = int(self.headers["Content-Length"]); self.rfile.read(n)
+        self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
 
 class TestMeasure(unittest.TestCase):
     @classmethod
@@ -30,11 +26,19 @@ class TestMeasure(unittest.TestCase):
     def tearDownClass(cls): cls.srv.shutdown()
 
     def test_download_upload(self):
-        d = measure.download_test(self.base, seconds=2.5); u = measure.upload_test(self.base, seconds=2.5)
+        d = measure.download_test(self.base, seconds=2.5, ramp=0.5); u = measure.upload_test(self.base + "/__up", seconds=2.5, ramp=0.5)
         print(f"loopback dl={d:.0f} Mbps ul={u:.0f} Mbps"); self.assertGreater(d, 50); self.assertGreater(u, 50)
 
     def test_test_error(self):
         with self.assertRaises(measure.TestError): measure.download_test("http://127.0.0.1:1", seconds=1)
+
+    def test_403_big_request_then_fallback(self):   # reproduces the real-world failure: server refuses huge requests
+        with self.assertRaises(measure.TestError): measure.download_test(self.base, req_bytes=200_000_000, seconds=1)
+        self.assertGreater(measure.download_test(self.base, seconds=1.5, ramp=0.3), 10)
+        old = measure.DOWNLOAD_FALLBACKS; measure.DOWNLOAD_FALLBACKS = [self.base + "/file?bytes=5000000"]
+        try:
+            mbps, src = measure.smart_download("http://127.0.0.1:1"); self.assertIn("/file", src); self.assertGreater(mbps, 10)
+        finally: measure.DOWNLOAD_FALLBACKS = old
 
     def test_ping_monitor_stats(self):
         s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(50); port = s.getsockname()[1]
