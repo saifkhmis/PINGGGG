@@ -1,0 +1,14 @@
+name: build-windows-installer
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", architecture: x64 }
+      - run: choco install innosetup -y --no-progress
+      - run: ./build.ps1
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with: { name: SmartPingStabilizer-Setup, path: installer_out/SmartPingStabilizer-Setup.exe }
